@@ -582,6 +582,100 @@ def _install_response_pascalcase_unhook(aa_module: Any, force: bool = False) -> 
     return True
 
 
+def _install_transport_response_unhook(force: bool = False) -> bool:
+    """Deobfuscate tool names at the per-transport normalize_response path.
+
+    PR #7 only patches ``agent.anthropic_adapter.normalize_anthropic_response``,
+    but current Hermes routes OAuth responses through
+    ``agent.transports.anthropic.AnthropicTransport.normalize_response``
+    (the per-transport path).  Without this hook, MD5'd tool names come back
+    from Anthropic as ``t_<hash>`` and Hermes's tool dispatcher errors with
+    ``Tool 't_xxxxxxxx' does not exist`` and infinite-loops on retries.
+
+    Patch contributed by @TimothyStackd in kristianvast/hermes-claude-auth#7
+    (2026-04-27 comment).  Verified working on hermes-agent against
+    claude-sonnet-4-6 and claude-opus-4-7 with composio + pipeboard +
+    custom hedge MCPs.
+
+    Note on the prefix: Hermes's OAuth path at anthropic_adapter:1491
+    unconditionally prepends ``mcp_`` to every tool def name, even when the
+    registered MCP-server tool name already starts with ``mcp_``
+    (e.g., ``mcp_composio_*``).  After the bridge's outgoing strip, the OBF
+    map's value is the dispatcher-expected form — so we restore the
+    deobfuscated name AS-IS.  Adding another ``mcp_`` would produce
+    ``mcp_mcp_*`` and break dispatch.
+    """
+    try:
+        from agent.transports import anthropic as transport_mod  # type: ignore[import-not-found]
+    except Exception as exc:
+        logger.warning(
+            "transport_unhook_failed_import: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        sys.stderr.write(
+            f"[anthropic_billing_bypass] transport_unhook_failed_import: "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+        return False
+
+    cls = getattr(transport_mod, "AnthropicTransport", None)
+    if cls is None:
+        logger.warning("AnthropicTransport not found; skipping transport unhook")
+        return False
+    if getattr(cls, "_CLAUDE_CODE_TRANSPORT_UNHOOK_APPLIED", False) and not force:
+        logger.debug("transport response unhook already installed")
+        return True
+
+    original_normalize = getattr(cls, "normalize_response", None)
+    if not callable(original_normalize):
+        logger.warning(
+            "AnthropicTransport.normalize_response not found; skipping transport unhook"
+        )
+        return False
+
+    def patched_normalize_response(self, response, **kwargs):
+        result = original_normalize(self, response, **kwargs)
+        try:
+            tool_calls = getattr(result, "tool_calls", None)
+            if tool_calls:
+                for tc in tool_calls:
+                    name = getattr(tc, "name", None)
+                    if not isinstance(name, str) or not name:
+                        continue
+                    deobf = _TOOL_NAME_OBF_MAP.get(name)
+                    if deobf is None:
+                        continue
+                    try:
+                        tc.name = deobf
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning(
+                "transport response deobfuscation raised %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+        return result
+
+    patched_normalize_response.__name__ = original_normalize.__name__
+    patched_normalize_response.__qualname__ = getattr(
+        original_normalize, "__qualname__", original_normalize.__name__
+    )
+    patched_normalize_response.__doc__ = original_normalize.__doc__
+    patched_normalize_response.__wrapped__ = original_normalize  # type: ignore[attr-defined]
+
+    cls.normalize_response = patched_normalize_response
+    cls._CLAUDE_CODE_TRANSPORT_UNHOOK_APPLIED = True  # type: ignore[attr-defined]
+    logger.info(
+        "Transport response deobfuscation installed on AnthropicTransport.normalize_response"
+    )
+    sys.stderr.write(
+        "[anthropic_billing_bypass] AnthropicTransport response deobfuscation installed\n"
+    )
+    return True
+
+
 def _install_aux_client_hook(force: bool = False) -> bool:
     """Patch the auxiliary client to strip temperature on OAuth adaptive models."""
     try:
@@ -765,6 +859,7 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     sys.stderr.write("[anthropic_billing_bypass] Claude Code OAuth bypass installed\n")
 
     _install_response_pascalcase_unhook(aa)
+    _install_transport_response_unhook()
     _install_aux_client_hook()
 
     return True
