@@ -31,6 +31,43 @@ if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:
     sys.path.insert(0, _PATCHES_DIR)
 
 
+def _seed_env_from_hermes_dotenv() -> None:
+    """Seed os.environ from ~/.hermes/.env at interpreter boot.
+
+    Hermes-agent's load_env() returns a dict without mutating os.environ,
+    which breaks auxiliary clients (vision, web_extract, etc.) that read
+    OPENAI_API_KEY / OPENROUTER_API_KEY directly from os.environ.
+
+    This seeder ensures every hermes process (main, delegated, gateway)
+    has access to the keys without requiring them in the shell environment.
+
+    Only sets keys that aren't already in os.environ — respects shell overrides.
+    """
+    env_path = os.path.expanduser("~/.hermes/.env")
+    if not os.path.isfile(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and value and key not in os.environ:
+                    os.environ[key] = value
+    except Exception as exc:
+        sys.stderr.write(
+            f"[hermes-claude-auth] _seed_env_from_hermes_dotenv failed: "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+
+
+# Seed BEFORE hook installation so auxiliary clients can resolve providers
+_seed_env_from_hermes_dotenv()
+
+
 def _install_hook() -> None:
     try:
         from importlib.abc import MetaPathFinder
