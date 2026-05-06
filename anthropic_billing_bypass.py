@@ -108,11 +108,20 @@ Version history
   seeds ``os.environ`` from ``~/.hermes/.env`` at interpreter boot so auxiliary
   clients (vision, web_extract, etc.) can resolve provider keys without shell
   exports.  Naoto13 fork.
+- 1.5.0 (2026-05-06): Account linking absorption.  Cherry-picks the
+  ``user_id`` metadata injection from PR#10 (graydeon, lckx/main 1.4.0-pr10)
+  WITHOUT inheriting that lineage's regressions (MD5 obfuscation removal,
+  aux-client temperature hook removal, defensive try/except removal,
+  signature introspection removal).  Reads ``~/.claude.json:oauthAccount.
+  accountUuid`` and injects as ``api_kwargs["metadata"]["user_id"]`` so
+  multi-account operators (work+personal, rotation pools) bind requests
+  to the correct Pro/Max subscription tier.  Bumps minor (not patch)
+  because this changes wire format on every OAuth request.
 """
 
 from __future__ import annotations
 
-__version__ = "1.2.1"
+__version__ = "1.5.0"
 
 import hashlib
 import inspect
@@ -497,6 +506,60 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     _rewrite_tool_names_pascalcase(api_kwargs)
     _merge_spoof_extras(api_kwargs)
     _fix_temperature_for_oauth_adaptive(api_kwargs, site="build_kwargs")
+
+    # Account linking: bind request to the Claude Pro/Max account UUID so
+    # billing routes correctly when the operator has multiple Anthropic
+    # accounts (work + personal, or rotation pool).  Ported from PR#10
+    # (graydeon, kristianvast/hermes-claude-auth#10) — value-add absorbed
+    # into Lineage B.
+    metadata = _get_account_metadata()
+    if metadata:
+        existing_metadata = api_kwargs.get("metadata")
+        if isinstance(existing_metadata, dict):
+            for k, v in metadata.items():
+                existing_metadata.setdefault(k, v)
+        else:
+            api_kwargs["metadata"] = metadata
+
+
+# ---------------------------------------------------------------------------
+# Account metadata (PR#10 absorption — account linking)
+# ---------------------------------------------------------------------------
+
+
+def _read_claude_config() -> Dict[str, Any]:
+    """Read ~/.claude.json safely.  Returns empty dict on any failure."""
+    import json
+    import os
+    path = os.path.expanduser("~/.claude.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.debug("_read_claude_config failed: %s: %s", type(exc).__name__, exc)
+        return {}
+
+
+def _get_account_metadata() -> Dict[str, Any]:
+    """Extract Anthropic account UUID for request metadata binding.
+
+    The Claude Code CLI persists the active account at
+    ``~/.claude.json:oauthAccount.accountUuid``.  Anthropic's billing routes
+    requests to the corresponding subscription tier when ``user_id`` is set
+    in the request metadata.  Without this, multi-account setups can drift
+    to wrong billing or hit per-account rate limits asymmetrically.
+    """
+    config = _read_claude_config()
+    oauth = config.get("oauthAccount", {})
+    if not isinstance(oauth, dict):
+        return {}
+    account_uuid = oauth.get("accountUuid")
+    if isinstance(account_uuid, str) and account_uuid:
+        return {"user_id": account_uuid}
+    return {}
 
 
 # ---------------------------------------------------------------------------
