@@ -97,11 +97,22 @@ Version history
   Replaces PascalCase rewrite with MD5 hashing: all tool names are rewritten
   to ``t_<8hexchars>`` in outgoing requests, with a bidirectional map used to
   restore original names from responses.  Ports opencode-claude-auth PR #193.
+- 1.2.1 (2026-05-06): Topology-aware legacy unhook.  Hermes-agent ≥ 2026-04
+  removed top-level ``normalize_anthropic_response`` from
+  ``agent.anthropic_adapter`` and moved normalization to per-transport
+  ``AnthropicTransport.normalize_response``.  ``_install_response_pascalcase_unhook``
+  now detects modern-transport topology (via ``agent.transports.anthropic``
+  import probe) and demotes the absent-function log to DEBUG instead of
+  emitting a misleading WARNING.  When BOTH legacy AND transport modules are
+  missing, the WARNING is preserved (real defect).  Also: ``sitecustomize_hook.py``
+  seeds ``os.environ`` from ``~/.hermes/.env`` at interpreter boot so auxiliary
+  clients (vision, web_extract, etc.) can resolve provider keys without shell
+  exports.  Naoto13 fork.
 """
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import hashlib
 import inspect
@@ -532,7 +543,22 @@ def _install_response_pascalcase_unhook(aa_module: Any, force: bool = False) -> 
 
     original = getattr(aa_module, "normalize_anthropic_response", None)
     if not callable(original):
-        logger.warning("normalize_anthropic_response not found; skipping response unhook")
+        # Hermes-agent >= 2026-04 moved normalize to AnthropicTransport.normalize_response
+        # (see agent/transports/anthropic.py). The transport unhook installed by
+        # _install_transport_response_unhook() covers the modern path; this legacy
+        # top-level unhook is only relevant for hermes-agent < 2026-04.
+        # Detect transport topology and silence the warning when modern path exists.
+        try:
+            from agent.transports import anthropic as _modern_transport  # noqa: F401
+            logger.debug(
+                "legacy normalize_anthropic_response absent; modern transport "
+                "topology detected — transport unhook handles deobfuscation"
+            )
+        except ImportError:
+            logger.warning(
+                "normalize_anthropic_response not found AND transport module "
+                "missing; bypass response deobfuscation may be incomplete"
+            )
         return False
 
     def patched_normalize(response: Any, strip_tool_prefix: bool = False, **kwargs: Any) -> Any:
